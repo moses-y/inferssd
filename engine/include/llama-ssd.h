@@ -33,10 +33,12 @@ LLAMA_API size_t llama_ssd_schema_json(char * output, size_t output_size);
 
 // The facts of the model the N_PATHS PATHS name, as the engine would load it, from its files' headers alone: no weight
 // is read and no backend starts. PATHS[0] is a GGUF file or a split model's first shard and the rest are its extra
-// shards, as llama_model_load_from_splits takes them (--shard/--ple). One JSON object goes to WRITE: its files, the
-// metadata of the model and its architecture, every tensor it loads (type, shape, file, offset, bytes) and, for a
-// model with routed experts, their layout. False leaves WRITE uncalled and says why in ERROR.
-LLAMA_API bool llama_ssd_model_facts(const char * const * paths, size_t n_paths,
+// shards, as llama_model_load_from_splits takes them (--shard/--ple). MTP is llama_model_params.mtp: the model as it
+// loads to draft with its MTP head (--spec-type draft-mtp), the head's file among the extra shards. One JSON object goes
+// to WRITE: its files, the metadata of the model and its architecture, every tensor it loads (type, shape, file, offset,
+// bytes), for a model with routed experts their layout, and draft_layers, the layers it loads only to draft with (the
+// head's block, after its own layers), 0 without a head. False leaves WRITE uncalled and says why in ERROR.
+LLAMA_API bool llama_ssd_model_facts(const char * const * paths, size_t n_paths, bool mtp,
     void (*write)(const char * text, size_t size, void * user), void * user, char * error, size_t error_size);
 
 // Request lifecycle transition; counts are tokens after prompt-cache reuse.
@@ -49,6 +51,11 @@ LLAMA_API bool llama_ssd_prefill_phase(struct llama_context * ctx, bool active,
 // What no request uses is as good as an empty slot to what allocates later. A context without SSD experts returns
 // true and does nothing; false reports a failure, after which the caches fill as requests run.
 LLAMA_API bool llama_ssd_preload(struct llama_context * ctx);
+
+// The wall time in microseconds the context's CPU expert sink has spent in its calls since the context was created:
+// the routed experts its graphs ran on the CPU, the reads of those no cache held included. The time of a decode less
+// the sink's part of it is the time of its other work. 0 for a context without an SSD expert executor.
+LLAMA_API double llama_ssd_sink_time_us(const struct llama_context * ctx);
 
 // Keep this reservation alive until allocation and first touch finish. NULL
 // means refusal. A context without the Linux SSD executor returns a valid no-op

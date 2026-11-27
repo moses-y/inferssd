@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from inferssd.engine import decode_steps
 from inferssd.launch.resources import GPU_BACKENDS
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine import characteristics
@@ -29,6 +30,20 @@ class RecordedArtifacts:
             return Reply(Path(args[0]).is_file())
         if name == "is_executable":
             return Reply(os.access(args[0], os.X_OK))
+        if name == "draft_heads":
+            # [path, bytes] of the MTP head files (mtp-*.gguf) in the directory ARGS[0]
+            directory = Path(args[0])
+            if not directory.is_dir():
+                return Reply([])
+            return Reply(
+                sorted(
+                    [str(path), path.stat().st_size]
+                    for path in directory.iterdir()
+                    if path.name.lower().startswith("mtp-")
+                    and path.name.lower().endswith(".gguf")
+                    and path.is_file()
+                )
+            )
         if name == "read_text":
             with open(args[0], encoding="utf-8", newline="") as stream:
                 return Reply(stream.read())
@@ -56,6 +71,8 @@ class RecordedArtifacts:
         ):
             # Absent: no strategy, no drive term in it, or an engine whose GPU backends are unknown.
             return Reply(None)
+        if name == "decode_steps" and name not in self.host:
+            return Reply(None)  # no decode probe measurement kept on the recorded machine
         if name == "systemd" and name not in self.host:
             # Recordings made before this fact existed came from systemd hosts.
             return Reply(True)
@@ -90,10 +107,23 @@ class RecordedArtifacts:
                 return Reply(characteristics.dumps(characteristics.validate(value)))
             except ValueError as error:
                 raise ValueError(f"Recorded host fact {name}: {error}") from error
-        if name in ("model_facts", "runtime_facts"):
+        if name == "draft_model_facts" and isinstance(value, str):
+            return Reply(value)  # why the engine read no facts of the model with its head
+        if name in ("decode_steps", "decode_probe"):
+            # A decode probe's measurement (inferssd.engine.decode_steps); none kept, or why the
+            # probe measured nothing.
+            if (name == "decode_steps" and value is None) or (
+                name == "decode_probe" and isinstance(value, str)
+            ):
+                return Reply(value)
+            try:
+                return Reply(decode_steps.validate(value))
+            except ValueError as error:
+                raise ValueError(f"Recorded host fact {name}: {error}") from error
+        if name in ("model_facts", "draft_model_facts", "runtime_facts"):
             # Serialised strategy inputs, read back strictly and written out again.
             try:
-                if name == "model_facts":
+                if name != "runtime_facts":
                     facts = strategy_inputs.model_facts_from(value)
                     return Reply(strategy_inputs.model_facts_json(facts))
                 runtime = strategy_inputs.runtime_facts_from(value)

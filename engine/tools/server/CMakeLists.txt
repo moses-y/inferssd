@@ -16,6 +16,8 @@ add_library(${TARGET} STATIC
     inferssd/code-mode.cpp
     inferssd/code-mode.h
     inferssd/checkpoint.h
+    inferssd/decode-probe.cpp
+    inferssd/decode-probe.h
     inferssd/identifiers.cpp
     inferssd/identifiers.h
     inferssd/runtime.h

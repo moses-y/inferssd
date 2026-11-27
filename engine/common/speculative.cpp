@@ -618,6 +618,32 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 };
 
+bool common_speculative_mtp_step(llama_context * ctx, llama_batch & batch, std::vector<float> & h, llama_token token,
+        llama_pos pos, llama_seq_id seq_id, llama_token & best, double & p) {
+    common_batch_clear(batch);
+    common_batch_add(batch, token, pos, { seq_id }, true);
+    if (llama_decode_mtp(ctx, batch, h.data()) != 0) {
+        LOG_WRN("%s: the MTP draft step at position %d failed\n", __func__, pos);
+        return false;
+    }
+
+    // greedy: the most likely token, and how sure the head is of it
+    const float * logits = llama_get_logits_ith(ctx, 0);
+    const float * h_next = llama_get_embeddings_nextn_ith(ctx, 0);
+    if (logits == nullptr || h_next == nullptr) {
+        return false;
+    }
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    best = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    double sum = 0.0;
+    for (int32_t t = 0; t < n_vocab; ++t) {
+        sum += std::exp((double) logits[t] - (double) logits[best]);
+    }
+    p = 1.0 / sum;
+    h.assign(h_next, h_next + h.size());
+    return true;
+}
+
 // MTP: the draft head published with the model (llama_model_params.mtp), run in the target's own context. The
 // target's decodes leave the head's cache rows of their tokens and the hidden states of their output rows; a draft
 // is the head's steps from the hidden state of the last position the target kept, each step reading the hidden
@@ -626,7 +652,6 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
     llama_context * ctx;
     llama_batch     batch;
     int32_t         n_embd_h;
-    int32_t         n_vocab;
 
     // the hidden states of the output rows of the target's last decode of the sequence, by position
     llama_seq_id           seq_id = 0;
@@ -639,7 +664,6 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
         : common_speculative_state(type), ctx(ctx) {
         const llama_model * model = llama_get_model(ctx);
         n_embd_h = llama_model_n_embd_h(model);
-        n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
         batch    = llama_batch_init(1, 0, 1);
         llama_set_embeddings_nextn(ctx, true, /* masked */ true);
     }
@@ -701,29 +725,14 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
 
         llama_token tok = id_last;
         for (int32_t k = 0; k < params.draft.n_max; ++k) {
-            common_batch_clear(batch);
-            common_batch_add(batch, tok, pos_last + 1 + k, { seq_id }, true);
-            if (llama_decode_mtp(ctx, batch, h_step.data()) != 0) {
-                LOG_WRN("%s: the MTP draft step at position %d failed\n", __func__, pos_last + 1 + k);
-                break;
-            }
-
-            // greedy: the most likely token, while the head is sure enough of it
-            const float * logits = llama_get_logits_ith(ctx, 0);
-            const float * h      = llama_get_embeddings_nextn_ith(ctx, 0);
-            if (logits == nullptr || h == nullptr) {
-                break;
-            }
-            const llama_token best = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
-            double sum = 0.0;
-            for (int32_t t = 0; t < n_vocab; ++t) {
-                sum += std::exp((double) logits[t] - (double) logits[best]);
-            }
-            if (1.0 / sum < params.draft.p_min) {
+            // greedy, while the head is sure enough of its token
+            llama_token best;
+            double p;
+            if (!common_speculative_mtp_step(ctx, batch, h_step, tok, pos_last + 1 + k, seq_id, best, p) ||
+                    p < params.draft.p_min) {
                 break;
             }
             result.push_back(best);
-            h_step.assign(h, h + n_embd_h);
             tok = best;
         }
 
@@ -1393,6 +1402,86 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
     }
 
     return n_min;
+}
+
+static void common_speculative_adapt_add(common_speculative_adapt & a, int n, double ms, double tokens) {
+    const bool measured = n == a.last;
+    a.last = n;
+    if (!measured || n < 0 || ms <= 0.0) {
+        return;
+    }
+    if (a.t_len.size() <= size_t(n)) {
+        a.t_len.resize(n + 1, 0.0);
+        a.n_len.resize(n + 1, 0.0);
+        a.c_len.resize(n + 1, 0);
+    }
+    // the mean of the first measurements, then the recent ones weigh more
+    const double w = std::max(common_speculative_adapt::rate, 1.0 / ++a.c_len[n]);
+    a.t_len[n] += w * (ms - a.t_len[n]);
+    a.n_len[n] += w * (tokens - a.n_len[n]);
+}
+
+void common_speculative_adapt::on_plain(double ms) {
+    const int n = pending >= 0 ? pending : 0;
+    common_speculative_adapt_add(*this, n, ms + (pending >= 0 ? pending_ms : 0.0), 1.0);
+    pending = -1;
+    pending_ms = 0.0;
+}
+
+void common_speculative_adapt::on_empty(int n_len, double draft_ms) {
+    pending = n_len;
+    pending_ms = draft_ms;
+}
+
+void common_speculative_adapt::on_block(int n_len, int n_accepted, double ms) {
+    common_speculative_adapt_add(*this, n_len, ms, 1.0 + n_accepted);
+    pending = -1;
+    pending_ms = 0.0;
+}
+
+double common_speculative_adapt::rate_of(int n) const {
+    if (n < 0 || size_t(n) >= t_len.size() || t_len[n] <= 0.0) {
+        return 0.0;
+    }
+    return n_len[n] / t_len[n];
+}
+
+int common_speculative_adapt::best(int n_max) const {
+    int b = 0;
+    for (int n = 1; n <= n_max; ++n) {
+        if (rate_of(n) > rate_of(b)) {
+            b = n;
+        }
+    }
+    return b;
+}
+
+int common_speculative_adapt::choose(int n_max) {
+    if (n_max <= 0) {
+        return 0;
+    }
+    if (hold > 0 && held >= 0) {
+        --hold;
+        return std::min(held, n_max);
+    }
+    if (n_warm < n_max + 1) {
+        held = n_warm++;
+    } else if (++n_best > probe_every) {
+        // the next length other than the best, for a burst
+        const int b = best(n_max);
+        held = (b + 1 + n_probe++ % n_max) % (n_max + 1);
+        n_best = 0;
+    } else {
+        held = best(n_max);
+        hold = 0;
+        return held;
+    }
+    // a burst of a length other than the best: its measurements start again, the burst's replacing the old ones
+    if (size_t(held) < c_len.size()) {
+        c_len[held] = 0;
+    }
+    hold = burst - 1;
+    return std::min(held, n_max);
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
