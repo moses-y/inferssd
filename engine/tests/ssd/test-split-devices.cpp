@@ -61,6 +61,41 @@ static void check(const char * label, const std::vector<float> & split, bool ref
     std::printf("%s: %s\n", label, expected.c_str());
 }
 
+// A registry with two GPUs, which only the default placement counts, named as the CUDA sources build it:
+// CUDA, or ROCm when HIP builds them.
+static const char * two_gpus_name = "CUDA";
+static ggml_backend_reg two_gpus = {
+    /* .api_version = */ GGML_BACKEND_API_VERSION,
+    /* .iface       = */ {
+        /* .get_name         = */ [](ggml_backend_reg_t) { return two_gpus_name; },
+        /* .get_device_count = */ [](ggml_backend_reg_t) -> size_t { return 2; },
+        /* .get_device       = */ [](ggml_backend_reg_t, size_t) -> ggml_backend_dev_t { return nullptr; },
+        /* .get_proc_address = */ [](ggml_backend_reg_t, const char *) -> void * { return nullptr; },
+    },
+    /* .context     = */ nullptr,
+};
+
+// The split mode a launch's model parameters take with two such GPUs and no placement of its own.
+static void check_default(const char * label, bool ssd, bool experts, bool explicit_split,
+                          llama_split_mode expected) {
+    common_params params;
+    params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    params.split_mode_explicit = explicit_split;
+    if (ssd) {
+        params.ssd_enabled = true;
+        if (experts) {
+            params.ssd_overrides.emplace_back("expert.source", "[\"absent-split-topology-model.gguf\"]");
+        }
+    }
+    common_ssd_prepare(params);
+    const auto mode = common_model_params_to_llama(params).split_mode;
+    if (mode != expected) {
+        throw std::runtime_error(std::string(label) + ": split mode " + std::to_string(mode) + ", expected " +
+                                 std::to_string(expected));
+    }
+    std::printf("%s: split mode %d\n", label, mode);
+}
+
 int main() {
     // Keep the topology independent of the runner's own GPUs.
     const auto cpu = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
@@ -81,5 +116,16 @@ int main() {
     check("two discrete", {0, 1}, false);
     check("third unavailable", {0, 0, 1}, true);
     check("ordinary model", {0, 0, 1}, false, {}, false);
+
+    ggml_backend_register(&two_gpus);
+    for (const char * name : { "CUDA", "ROCm" }) {
+        two_gpus_name = name;
+        std::printf("two %s GPUs\n", name);
+        check_default("SSD launch with routed experts", true, true, false, LLAMA_SPLIT_MODE_NONE);
+        // Its layers' matrices are homed for one GPU: split over two, the load refused them.
+        check_default("SSD launch without routed experts", true, false, false, LLAMA_SPLIT_MODE_NONE);
+        check_default("explicit layer split", true, false, true, LLAMA_SPLIT_MODE_LAYER);
+        check_default("launch without the SSD path", false, false, false, LLAMA_SPLIT_MODE_LAYER);
+    }
     return 0;
 }
