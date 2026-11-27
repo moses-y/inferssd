@@ -2365,9 +2365,9 @@ private:
         }
     }
 
-    // Checkpoints inside the prompt tokens of the slot that the last batch decoded, for a memory that can save an
-    // earlier state (llama_state_seq_at_align), at the positions where a later prompt is likely to branch off: the
-    // prompt's points (task->points: the ends of the shared and the context prefix and the branch points inside
+    // Save a shared prefix at the decoded batch boundary, or take checkpoints inside the batch for a memory
+    // that can save an earlier state (llama_state_seq_at_align). Take checkpoints where a later prompt is likely
+    // to branch off: the prompt's points (task->points: the ends of the shared and context prefixes and the points inside
     // them), a few tokens before the end of the prompt (the generation prompt may be rendered differently in the next
     // turn) and every checkpoint_every_nt tokens, each rounded down to a position the memory can save. The shared and
     // the context prefix also go to the prompt cache, where a conversation started later, or after a restart, finds
@@ -2378,6 +2378,10 @@ private:
         slot.prompt_batch.row_end = -1;
 
         const int64_t align = checkpoint_at_align;
+        if (align == 0) {
+            keep_shared_prefix(slot, n1, true);
+            return;
+        }
         const auto & points = slot.task->points;
 
         std::vector<int64_t> at;
@@ -3416,6 +3420,14 @@ private:
                         n_ubatch = llama_n_ubatch(ctx);
                     }
 
+                    // A disk cache for memory that can only save its current state stops at the base-model shared
+                    // prefix. Save it as soon as that batch decodes, before the next batch or a cancellation.
+                    const int64_t n_shared = slot.task->points.n_shared;
+                    const int64_t persist_at = checkpoint_at_align == 0 && prompt_cache && prompt_cache->on_disk() &&
+                        slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
+                        !input_tokens.has_mtmd && n_shared >= 64 && slot.n_prompt_tokens_cache < n_shared &&
+                        slot.prompt.adapter_key && slot.prompt.adapter_key->empty() ? n_shared : 0;
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be
@@ -3510,8 +3522,9 @@ private:
                         // checkpoint_decoded_prompt() keeps. Upstream also stops n_ubatch tokens earlier
                         // (ggml-org/llama.cpp#20288), for a checkpoint that the end one replaces at once with
                         // --ctx-checkpoints 1; each extra prompt batch streams the experts again.
-                        if (do_checkpoint && server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
-                                                                       slot.task->points, n_batch)) {
+                        if (slot.prompt.n_tokens() == persist_at ||
+                            (do_checkpoint && server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
+                                                                        slot.task->points, n_batch))) {
                             break;
                         }
                         // A memory checkpointed after the batch keeps a point's state only while the ubatch that went
@@ -3533,7 +3546,7 @@ private:
                     const bool    at_point      = do_checkpoint && n_batch_start >= 64 && slot.task->points.has(n_batch_start);
                     const int64_t n_at_shared   = at_point && slot.task->points.kept(n_batch_start) ? n_batch_start : 0;
 
-                    if (checkpoint_after_decode && n_tokens_cur > 0 && !has_mtmd) {
+                    if ((checkpoint_after_decode || slot.prompt.n_tokens() == persist_at) && n_tokens_cur > 0 && !has_mtmd) {
                         slot.prompt_batch.n0      = slot.prompt.n_tokens() - n_tokens_cur;
                         slot.prompt_batch.n1      = slot.prompt.n_tokens();
                         slot.prompt_batch.row_end = batch.n_tokens;
@@ -3599,7 +3612,8 @@ private:
                     }
                     // The state is still the one after the shared or the context prefix, computed by this task
                     // rather than reused (the prompt cache holds those already).
-                    if (n_at_shared > 0 && slot.n_prompt_tokens_cache < n_at_shared && pos_min >= 0 && !has_mtmd) {
+                    if (n_at_shared > 0 && n_at_shared != persist_at &&
+                        slot.n_prompt_tokens_cache < n_at_shared && pos_min >= 0 && !has_mtmd) {
                         keep_shared_prefix(slot, n_at_shared, true);
                     }
                 }
