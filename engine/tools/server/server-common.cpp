@@ -1267,17 +1267,25 @@ static std::string server_tool_mcp_server(const json & tool) {
     return name.substr(0, sep == std::string::npos ? name.size() : sep);
 }
 
-// The tools in the order every user of an app shares the most of: the client's own tools as sent, then the tools of
-// MCP servers, plugins and apps (named mcp__...), which differ from one user or computer to the next, grouped by
-// server in the order of the servers' names, each server's tools as sent. A tool is called by its name, so the
-// order says nothing to the model. Returns the end of each group in the new order: the client's own tools, then each
-// server's.
-static std::vector<size_t> server_order_tools(json & tools) {
+// The tools in the order every user of an app shares the most of: the client's own tools as sent, then the tools of MCP
+// servers, plugins and apps (named mcp__...), which differ from one user or computer to the next, grouped by server in
+// the order of the servers' names, each server's tools as sent, then the request's custom tools and the tools its
+// code-mode exec declares, as sent (custom_tools, their names). A custom tool takes free-form text, and the ChatGPT
+// desktop app's exec, which runs the JavaScript the model writes, lists the JavaScript API of the app's own tools after
+// a fixed preamble, so its description changes with the tools the app has, as do the tools it declares. A tool is
+// called by its name, so the order says nothing to the model. Returns the end of each group in the new order: the
+// client's own tools, each server's, the custom tools.
+static std::vector<size_t> server_order_tools(json & tools, const std::vector<std::string> & custom_tools) {
     std::vector<json> own;
     std::vector<std::pair<std::string, json>> servers; // (server, tool)
+    std::vector<json> custom;
     for (auto & tool : tools) {
+        const json function = json_value(tool, "function", json::object());
+        const std::string name = function.is_object() ? json_value(function, "name", std::string()) : std::string();
         std::string server = server_tool_mcp_server(tool);
-        if (server.empty()) {
+        if (std::find(custom_tools.begin(), custom_tools.end(), name) != custom_tools.end()) {
+            custom.push_back(std::move(tool));
+        } else if (server.empty()) {
             own.push_back(std::move(tool));
         } else {
             servers.emplace_back(std::move(server), std::move(tool));
@@ -1299,6 +1307,12 @@ static std::vector<size_t> server_order_tools(json & tools) {
             ends.push_back(ordered.size());
         }
     }
+    for (auto & tool : custom) {
+        ordered.push_back(std::move(tool));
+    }
+    if (!custom.empty()) {
+        ends.push_back(ordered.size());
+    }
     tools = std::move(ordered);
     return ends;
 }
@@ -1316,21 +1330,74 @@ json oaicompat_chat_params_parse(
     // prompt (see inferssd/identifiers.h).
     const bool user_context_system = json_value(body, SERVER_USER_CONTEXT_SYSTEM_MESSAGE, false);
     body.erase(SERVER_USER_CONTEXT_SYSTEM_MESSAGE);
-    const size_t user_context_data_chars = user_context_system ? json_value(body, SERVER_USER_CONTEXT_DATA_CHARS, (size_t) 0) : 0;
+    size_t user_context_data_chars = user_context_system ? json_value(body, SERVER_USER_CONTEXT_DATA_CHARS, (size_t) 0) : 0;
     body.erase(SERVER_USER_CONTEXT_DATA_CHARS);
+    size_t first_user_context_chars = json_value(body, SERVER_FIRST_USER_CONTEXT_CHARS, (size_t) 0);
+    body.erase(SERVER_FIRST_USER_CONTEXT_CHARS);
     if (body.contains("messages")) {
         server_strip_anthropic_billing_header(body.at("messages"));
         server_strip_claude_env_user_lines(body.at("messages"));
         server_drop_codex_cwd_root(body.at("messages"));
     }
+    // the data at the end of the user's context as sent: the stand-ins may make it longer or shorter (a home folder,
+    // the version of a plugin in a skill's path), so its length is counted again in the text the model sees
+    std::string user_context_data;
+    if (user_context_data_chars > 0 && body.contains("messages") && body.at("messages").is_array() &&
+            body.at("messages").size() > 1 && body.at("messages")[1].is_object()) {
+        const std::string context = json_value(body.at("messages")[1], "content", std::string());
+        if (user_context_data_chars <= context.size()) {
+            user_context_data = context.substr(context.size() - user_context_data_chars);
+        }
+    }
+    // the same for the context that opens the first user message: its text parts in order, as sent
+    std::string first_user_context;
+    if (first_user_context_chars > 0 && body.contains("messages") && body.at("messages").is_array()) {
+        const json & messages = body.at("messages");
+        size_t first = 0;
+        while (first < messages.size() && json_value(messages[first], "role", std::string()) == "system") {
+            ++first;
+        }
+        std::string text;
+        if (first < messages.size() && json_value(messages[first], "role", std::string()) == "user") {
+            const json content = json_value(messages[first], "content", json());
+            if (content.is_string()) {
+                text = content.get<std::string>();
+            } else if (content.is_array()) {
+                for (const json & part : content) {
+                    if (json_value(part, "type", std::string()) == "text") {
+                        text += json_value(part, "text", std::string());
+                    }
+                }
+            }
+        }
+        if (first_user_context_chars <= text.size()) {
+            first_user_context = text.substr(0, first_user_context_chars);
+        } else {
+            first_user_context_chars = 0;
+        }
+    }
     const server_identifier_map identifiers = server_identifiers_apply(body, server_identifier_env::current());
     if (!identifiers.empty()) {
         llama_params["prompt_identifiers"] = identifiers.to_json();
+        if (!user_context_data.empty()) {
+            user_context_data_chars = identifiers.to_stand_ins(user_context_data).size();
+        }
+        if (!first_user_context.empty()) {
+            first_user_context_chars = identifiers.to_stand_ins(first_user_context).size();
+        }
     }
 
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
-    const std::vector<size_t> tool_groups = has_tools ? server_order_tools(tools) : std::vector<size_t>();
+    // the custom tools of a Responses request (SERVER_CUSTOM_TOOLS) and the tools its code-mode exec declares
+    // (SERVER_CODE_MODE), whose fields stay in the request
+    std::vector<std::string> custom_tools = json_value(body, SERVER_CUSTOM_TOOLS, std::vector<std::string>());
+    const json code_mode       = json_value(body, SERVER_CODE_MODE, json::object());
+    const json code_mode_tools = json_value(code_mode, "tools", json::object());
+    for (const auto & [name, string_input] : code_mode_tools.items()) {
+        custom_tools.push_back(name);
+    }
+    const std::vector<size_t> tool_groups = has_tools ? server_order_tools(tools, custom_tools) : std::vector<size_t>();
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
 
@@ -1544,7 +1611,9 @@ json oaicompat_chat_params_parse(
     // their own they must be a prefix of the prompt; their length tells the server where to keep a reusable state.
     // When the last of them holds the user's context (SERVER_USER_CONTEXT_SYSTEM_MESSAGE), the shared prefix is the
     // app's own system message with the tools, which every user of the app starts with, and the context prefix is
-    // all of them, which the users with the same context start with: the server keeps a state at both.
+    // all of them, which the users with the same context start with: the server keeps a state at both. When the first
+    // user message opens with the user's context (SERVER_FIRST_USER_CONTEXT_CHARS), the context prefix runs to where
+    // the user's words start.
     // The user messages that follow them, up to the first reply, open the conversation: every later state of it
     // starts with them, which tells the prompt cache which of its states a new one replaces.
     {
@@ -1595,6 +1664,55 @@ json oaicompat_chat_params_parse(
             return line == std::string::npos ? 0 : line + 1;
         };
 
+        // For a first user message (message n) that opens with n_text characters of the user's context: where the
+        // user's words start, which is where the prompt of another conversation of the same setup parts from this one:
+        // the length the prompt shares with the messages up to that one whose words are others. 0 if there is none.
+        const auto words_start_chars = [&](size_t n, size_t n_text) -> size_t {
+            common_chat_templates_inputs probe_inputs = inputs;
+            probe_inputs.messages.resize(n + 1);
+            probe_inputs.add_generation_prompt = false;
+            common_chat_msg & first = probe_inputs.messages.back();
+            // the text after the context: one character that is not the words' first
+            const auto other_words = [](const std::string & text, size_t at) {
+                return text.substr(0, at) + (at < text.size() && text[at] == '-' ? "+" : "-");
+            };
+            if (first.content_parts.empty()) {
+                if (n_text > first.content.size()) {
+                    return 0;
+                }
+                first.content = other_words(first.content, n_text);
+            } else {
+                size_t i = 0;
+                for (; i < first.content_parts.size(); ++i) {
+                    const std::string & text = first.content_parts[i].text;
+                    if (first.content_parts[i].type != "text") {
+                        return 0;
+                    }
+                    if (n_text <= text.size()) {
+                        break;
+                    }
+                    n_text -= text.size();
+                }
+                if (i == first.content_parts.size()) {
+                    return 0;
+                }
+                first.content_parts[i].text = other_words(first.content_parts[i].text, n_text);
+                first.content_parts.resize(i + 1);
+            }
+            std::string probe;
+            try {
+                probe = common_chat_templates_apply(opt.tmpls.get(), probe_inputs).prompt;
+            } catch (const std::exception &) {
+                return 0;
+            }
+            const std::string & prompt = chat_params.prompt;
+            size_t common = 0;
+            while (common < probe.size() && common < prompt.size() && probe[common] == prompt[common]) {
+                ++common;
+            }
+            return common;
+        };
+
         size_t n_system = 0;
         while (n_system < inputs.messages.size() &&
                 (inputs.messages[n_system].role == "system" || inputs.messages[n_system].role == "developer")) {
@@ -1611,6 +1729,9 @@ json oaicompat_chat_params_parse(
                 n_context_chars = prefix_chars(n_system);
             } else {
                 n_chars = prefix_chars(n_system);
+                if (first_user_context_chars > 0 && inputs.messages[n_system].role == "user") {
+                    n_context_chars = words_start_chars(n_system, first_user_context_chars);
+                }
             }
             if (n_chars > 0) {
                 llama_params["shared_prefix_chars"] = n_chars;
@@ -1674,7 +1795,7 @@ json oaicompat_chat_params_parse(
                     }
                     branch.push_back(part_end(render(n_lead, part, nullptr), more));
                 }
-                if (n_context_chars > n_chars && inputs.messages[1].content_parts.empty() &&
+                if (user_context_system && n_context_chars > n_chars && inputs.messages[1].content_parts.empty() &&
                         user_context_data_chars <= inputs.messages[1].content.size()) {
                     const std::string & context = inputs.messages[1].content;
                     const std::string before = context.substr(0, context.size() - user_context_data_chars);

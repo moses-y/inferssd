@@ -1,6 +1,12 @@
 #include "server-chat.h"
 #include "server-common.h"
+#include "inferssd/app-versions.h"
+#include "inferssd/code-mode.h"
+#include "inferssd/identifiers.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <optional>
 #include <sstream>
 #include <unordered_set>
@@ -105,13 +111,160 @@ static std::string responses_tool_without_model_list(const std::string & descrip
     return out;
 }
 
+// A custom tool takes free-form text instead of JSON arguments (the ChatGPT app's exec, which runs the JavaScript the
+// model writes in Codex's code mode; Codex's apply_patch). It is offered as a function of one string argument,
+// "input"; its format (a grammar or plain text) has no chat-completions form. The Responses output turns a call of it
+// back into a custom_tool_call (SERVER_CUSTOM_TOOLS).
+static json responses_custom_tool_function(json tool) {
+    tool.erase("type");
+    tool.erase("format");
+    tool["parameters"] = json {
+        {"type", "object"},
+        {"properties", json {
+            {"input", json {
+                {"type",        "string"},
+                {"description", "The raw input text the tool's description asks for, not JSON-encoded."},
+            }},
+        }},
+        {"required",             json::array({"input"})},
+        {"additionalProperties", false},
+    };
+    return tool;
+}
+
+// The text of the JSON string that starts at `pos` (after its opening quote) as far as it is written: up to its
+// closing quote, or up to an escape sequence that is not whole yet (a surrogate pair counts as one).
+static std::string json_string_written(const std::string & s, size_t pos) {
+    const auto hex4 = [&](size_t at, uint32_t & cp) {
+        if (at + 4 > s.size()) {
+            return false;
+        }
+        cp = 0;
+        for (size_t i = at; i < at + 4; ++i) {
+            const char c = s[i];
+            const int  digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                               c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (digit < 0) {
+                return false;
+            }
+            cp = (cp << 4) | (uint32_t) digit;
+        }
+        return true;
+    };
+    std::string out;
+    while (pos < s.size() && s[pos] != '"') {
+        if (s[pos] != '\\') {
+            out += s[pos++];
+            continue;
+        }
+        if (pos + 1 >= s.size()) {
+            break;
+        }
+        const char escape = s[pos + 1];
+        if (escape != 'u') {
+            static const std::string from = "\"\\/bfnrt";
+            static const std::string to   = "\"\\/\b\f\n\r\t";
+            const size_t k = from.find(escape);
+            if (k == std::string::npos) {
+                break;
+            }
+            out += to[k];
+            pos += 2;
+            continue;
+        }
+        uint32_t cp  = 0;
+        size_t   len = 6;
+        if (!hex4(pos + 2, cp)) {
+            break;
+        }
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+            uint32_t low = 0;
+            if (s.compare(pos + 6, 2, "\\u") != 0 || !hex4(pos + 8, low) || low < 0xDC00 || low > 0xDFFF) {
+                break;
+            }
+            cp  = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+            len = 12;
+        }
+        if (cp < 0x80) {
+            out += (char) cp;
+        } else if (cp < 0x800) {
+            out += (char) (0xC0 | (cp >> 6));
+            out += (char) (0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += (char) (0xE0 | (cp >> 12));
+            out += (char) (0x80 | ((cp >> 6) & 0x3F));
+            out += (char) (0x80 | (cp & 0x3F));
+        } else {
+            out += (char) (0xF0 | (cp >> 18));
+            out += (char) (0x80 | ((cp >> 12) & 0x3F));
+            out += (char) (0x80 | ((cp >> 6) & 0x3F));
+            out += (char) (0x80 | (cp & 0x3F));
+        }
+        pos += len;
+    }
+    return out;
+}
+
+std::string server_chat_custom_tool_input(const std::string & arguments, bool partial) {
+    if (!partial) {
+        try {
+            const json args = json::parse(arguments);
+            if (args.is_object() && args.contains("input") && args.at("input").is_string()) {
+                return args.at("input").get<std::string>();
+            }
+        } catch (const std::exception &) {
+            // not JSON: the arguments as they are
+        }
+        return arguments;
+    }
+    size_t pos = 0;
+    const auto take = [&](const char * token) {
+        while (pos < arguments.size() && std::isspace((unsigned char) arguments[pos])) {
+            ++pos;
+        }
+        const size_t n = std::char_traits<char>::length(token);
+        if (arguments.compare(pos, n, token) != 0) {
+            return false;
+        }
+        pos += n;
+        return true;
+    };
+    if (!take("{") || !take("\"input\"") || !take(":") || !take("\"")) {
+        return std::string();
+    }
+    return json_string_written(arguments, pos);
+}
+
 // Takes out of the user's context the data that grows as the user works and returns it, to go at the context's end:
 // the command prefixes the user approved (a list at the end of the permission instructions, one more each time the
-// user allows a command for good) and the tools the account defers (a part of its own). The rest of the context then
-// stays the same from one conversation to the next, and the server keeps a state where the data starts. Only data
-// moves, each with the line that says what it is; the instructions keep their order.
+// user allows a command for good) and the tools the account defers (a part of its own). The sections the ChatGPT
+// desktop app adds to its app context when the user picks the detail mode Prose rather than Commands go there too,
+// first: Non-technical UI and Writing blocks, which say how to talk to the user and refer to nothing around them. The
+// rest of the context then stays the same from one conversation and one mode to the next, and the server keeps a
+// state where the data starts. Only these move, each with the line that says what it is; the rest keeps its order.
 static std::vector<std::string> responses_move_context_data(std::vector<std::string> & context_texts) {
     std::vector<std::string> data;
+    static const char * const prose_sections[] = { "\n\n### Non-technical UI\n", "\n\n### Writing blocks\n" };
+    for (auto & text : context_texts) {
+        const size_t start = text.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos || text.compare(start, 13, "<app-context>") != 0) {
+            continue;
+        }
+        for (const char * heading : prose_sections) {
+            const size_t begin = text.find(heading);
+            if (begin == std::string::npos) {
+                continue;
+            }
+            // the section runs to the next heading after a blank line, to the line that closes the app context or to
+            // the end of the text (Writing blocks comes after the closing line)
+            size_t end = std::min(text.find("\n\n#", begin + 2), text.find("\n</app-context>", begin + 2));
+            if (end == std::string::npos) {
+                end = text.size();
+            }
+            data.push_back(text.substr(begin + 2, end - begin - 2));
+            text.erase(begin, end - begin);
+        }
+    }
     static const std::string approved = "\n\n## Approved command prefixes\n";
     for (auto & text : context_texts) {
         const size_t start = text.find_first_not_of(" \t\r\n");
@@ -224,6 +377,49 @@ static bool responses_collapse_system_messages(std::vector<json> & messages, siz
     return user_context;
 }
 
+// The code-mode exec of a Responses request (inferssd/code-mode.h) as the prompt would name it ("functions::exec" in
+// its namespace), and the tools it declares, which the prompt offers in its place; none without such an exec. The
+// first exec among the request's tools and those of its additional_tools items counts, with its description as the
+// tools of Codex versions render it (inferssd/app-versions.h).
+struct responses_code_mode {
+    std::string                        exec;
+    std::vector<server_code_mode_tool> tools;
+};
+
+static responses_code_mode responses_code_mode_of(const json & response_body) {
+    std::vector<json> tools;
+    if (response_body.contains("tools") && response_body.at("tools").is_array()) {
+        tools.insert(tools.end(), response_body.at("tools").begin(), response_body.at("tools").end());
+    }
+    const json input = json_value(response_body, "input", json());
+    if (input.is_array()) {
+        for (const json & item : input) {
+            if (item.is_object() && json_value(item, "type", std::string()) == "additional_tools" &&
+                !item.contains("content")) {
+                for (const json & tool : json_value(item, "tools", json::array())) {
+                    tools.push_back(tool);
+                }
+            }
+        }
+    }
+    for (json tool : tools) {
+        server_unify_codex_tool(tool, server_identifier_env::current().windows);
+        const std::string type = json_value(tool, "type", std::string());
+        if (type == "namespace") {
+            const std::string ns = json_value(tool, "name", std::string());
+            for (const json & sub_tool : json_value(tool, "tools", json::array())) {
+                if (json_value(sub_tool, "type", std::string()) == "custom" &&
+                    json_value(sub_tool, "name", std::string()) == "exec" && !ns.empty()) {
+                    return { ns + "::exec", server_code_mode_tools(sub_tool) };
+                }
+            }
+        } else if (type == "custom" && json_value(tool, "name", std::string()) == "exec") {
+            return { "exec", server_code_mode_tools(tool) };
+        }
+    }
+    return {};
+}
+
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
@@ -235,6 +431,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     const json input_value = response_body.at("input");
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
+    const responses_code_mode code_mode = responses_code_mode_of(response_body);
     std::vector<json> chatcmpl_messages;
     std::vector<json> input_tools; // tools that additional_tools input items declare
 
@@ -382,21 +579,36 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     item["content"] = chatcmpl_content;
                     chatcmpl_messages.push_back(item);
                 }
-            } else if (exists_and_is_string(item, "arguments") &&
-                exists_and_is_string(item, "call_id") &&
+            } else if (exists_and_is_string(item, "call_id") &&
                 exists_and_is_string(item, "name") &&
                 exists_and_is_string(item, "type") &&
-                item.at("type") == "function_call"
+                ((item.at("type") == "function_call" && exists_and_is_string(item, "arguments")) ||
+                    (item.at("type") == "custom_tool_call" && exists_and_is_string(item, "input")))
             ) {
                 // #responses_create-input-input_item_list-item-function_tool_call
                 // A call of a namespace tool carries the namespace apart; the prompt names it "namespace::name".
+                // A call of a custom tool carries its free-form input, which the model wrote as the argument
+                // "input" of the function the tool is offered as (responses_custom_tool_function).
                 std::string name = item.at("name");
                 if (exists_and_is_string(item, "namespace") && !item.at("namespace").get<std::string>().empty()) {
                     name = item.at("namespace").get<std::string>() + "::" + name;
                 }
+                json arguments = item.at("type") == "custom_tool_call"
+                    ? json(json { {"input", item.at("input")} }.dump())
+                    : item.at("arguments");
+                // A call of a code-mode exec that runs the script the server writes for a call of a tool exec
+                // declares is that tool's call, as the model wrote it (server_code_mode_call).
+                std::string called;
+                std::string called_arguments;
+                if (item.at("type") == "custom_tool_call" && name == code_mode.exec && !code_mode.tools.empty() &&
+                    server_code_mode_call(item.at("input").get<std::string>(), code_mode.tools, called,
+                                          called_arguments)) {
+                    name      = called;
+                    arguments = called_arguments;
+                }
                 json tool_call = {
                     {"function", json {
-                        {"arguments", item.at("arguments")},
+                        {"arguments", arguments},
                         {"name",      name},
                     }},
                     {"id",   item.at("call_id")},
@@ -418,9 +630,10 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             } else if (exists_and_is_string(item, "call_id") && !item.at("call_id").get<std::string>().empty() &&
                 (exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
                 exists_and_is_string(item, "type") &&
-                item.at("type") == "function_call_output"
+                (item.at("type") == "function_call_output" || item.at("type") == "custom_tool_call_output")
             ) {
                 // #responses_create-input-input_item_list-item-function_tool_call_output
+                // The output of a custom tool takes the same form.
                 if (item.at("output").is_string()) {
                     chatcmpl_messages.push_back(json {
                         {"content",      item.at("output")},
@@ -450,7 +663,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 }
             } else if ((exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
                 exists_and_is_string(item, "type") &&
-                item.at("type") == "function_call_output"
+                (item.at("type") == "function_call_output" || item.at("type") == "custom_tool_call_output")
             ) {
                 // An output without a call_id answers no call: Codex adds context this way, such as the ChatGPT
                 // app's snapshot of the open Page from the second turn on. A chat template takes a tool message
@@ -523,13 +736,20 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             resp_tools.insert(resp_tools.end(), response_body.at("tools").begin(), response_body.at("tools").end());
         }
         resp_tools.insert(resp_tools.end(), input_tools.begin(), input_tools.end());
+        // every request of Codex offers the MCP tools the apps of a computer add (see inferssd/app-versions.h)
+        server_add_codex_common_tools(resp_tools, server_identifier_env::current().windows);
 
         // A tool keeps its first definition: Codex declares its additional_tools again in later turns.
         std::vector<json> chatcmpl_tools;
         std::unordered_set<std::string> tool_names;
-        const auto add_tool = [&](json function) {
-            if (!tool_names.insert(json_value(function, "name", std::string())).second) {
+        std::vector<std::string> custom_tools; // see SERVER_CUSTOM_TOOLS
+        const auto add_tool = [&](json function, bool custom) {
+            const std::string name = json_value(function, "name", std::string());
+            if (!tool_names.insert(name).second) {
                 return;
+            }
+            if (custom) {
+                custom_tools.push_back(name);
             }
             if (function.contains("description") && function.at("description").is_string()) {
                 function["description"] = responses_tool_without_model_list(function.at("description").get<std::string>());
@@ -543,35 +763,78 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             });
         };
         for (json resp_tool : resp_tools) {
+            // the tools of Codex versions render as one (see inferssd/app-versions.h)
+            server_unify_codex_tool(resp_tool, server_identifier_env::current().windows);
             const std::string type = json_value(resp_tool, "type", std::string());
             if (type == "namespace") {
-                // A namespace groups function tools (Codex: sub-agents, one per MCP server). Offer each as
-                // "namespace::name", the qualified name DeepSeek-V4.1's encoding uses, with the namespace's
-                // description ahead of its own; the Responses output splits the name again.
+                // A namespace groups function and custom tools (Codex: sub-agents, one per MCP server; the
+                // ChatGPT app: exec in "functions"). Offer each as "namespace::name", the qualified name
+                // DeepSeek-V4.1's encoding uses, with the namespace's description ahead of its own; the Responses
+                // output splits the name again.
                 const std::string ns      = json_value(resp_tool, "name", std::string());
                 const std::string ns_desc = json_value(resp_tool, "description", std::string());
                 for (json sub_tool : json_value(resp_tool, "tools", json::array())) {
-                    if (ns.empty() || json_value(sub_tool, "type", std::string()) != "function") {
+                    const std::string sub_type = json_value(sub_tool, "type", std::string());
+                    if (ns.empty() || (sub_type != "function" && sub_type != "custom")) {
                         LOG_WRN("Responses request: ignoring a tool in namespace '%s'\n", ns.c_str());
                         continue;
+                    }
+                    if (sub_type == "custom" && !code_mode.tools.empty() &&
+                        ns + "::" + json_value(sub_tool, "name", std::string()) == code_mode.exec) {
+                        continue; // the tools it declares take its place, below
+                    }
+                    if (sub_type == "custom") {
+                        sub_tool = responses_custom_tool_function(std::move(sub_tool));
                     }
                     sub_tool.erase("type");
                     sub_tool["name"] = ns + "::" + json_value(sub_tool, "name", std::string());
                     if (!ns_desc.empty()) {
                         sub_tool["description"] = ns_desc + "\n" + json_value(sub_tool, "description", std::string());
                     }
-                    add_tool(sub_tool);
+                    add_tool(sub_tool, sub_type == "custom");
                 }
                 continue;
             }
+            if (type == "custom" && !code_mode.tools.empty() &&
+                json_value(resp_tool, "name", std::string()) == code_mode.exec) {
+                continue; // the tools it declares take its place, below
+            }
+            if (type == "custom") {
+                add_tool(responses_custom_tool_function(std::move(resp_tool)), true);
+                continue;
+            }
             if (type != "function") {
-                // Hosted and grouped tools (web_search, namespace, custom, ...) have no chat-completions form.
-                // Clients such as Codex always send some; serve the request with its function tools.
+                // Hosted tools (web_search, image_generation, ...) have no chat-completions form. Clients such as
+                // Codex always send some; serve the request with its function and custom tools.
                 LOG_WRN("Responses request: ignoring a tool of type '%s'\n", type.c_str());
                 continue;
             }
             resp_tool.erase("type");
-            add_tool(resp_tool);
+            add_tool(resp_tool, false);
+        }
+        // The tools a code-mode exec declares, each as a function: a string tool (apply_patch) as a custom tool is.
+        // A tool of the same name the request offers otherwise keeps its own definition.
+        json code_mode_tools = json::object();
+        for (const server_code_mode_tool & tool : code_mode.tools) {
+            if (tool_names.count(tool.name) > 0) {
+                continue;
+            }
+            const json named = { { "name", tool.name }, { "description", tool.description } };
+            json function    = named;
+            if (tool.string_input) {
+                function = responses_custom_tool_function(named);
+            } else {
+                function["strict"]     = false;
+                function["parameters"] = tool.parameters;
+            }
+            add_tool(function, false);
+            code_mode_tools[tool.name] = tool.string_input;
+        }
+        if (!code_mode_tools.empty()) {
+            chatcmpl_body[SERVER_CODE_MODE] = { { "exec", code_mode.exec }, { "tools", code_mode_tools } };
+        }
+        if (!custom_tools.empty()) {
+            chatcmpl_body[SERVER_CUSTOM_TOOLS] = custom_tools;
         }
         chatcmpl_body.erase("tools");
         if (!chatcmpl_tools.empty()) {
@@ -650,12 +913,86 @@ static void anthropic_demote_mid_conversation_system_messages(json & messages) {
     messages = std::move(out);
 }
 
+// The text of a converted message that is Claude's environment block: it opens with "# Environment\n", inside a
+// <system-reminder> in the Claude desktop app. Empty for any other message.
+static std::string anthropic_environment_text(const json & message) {
+    const json content = json_value(message, "content", json());
+    std::string text;
+    if (content.is_string()) {
+        text = content.get<std::string>();
+    } else if (content.is_array()) {
+        for (const json & part : content) {
+            if (json_value(part, "type", std::string()) != "text") {
+                return std::string();
+            }
+            text += json_value(part, "text", std::string());
+        }
+    }
+    static const std::string reminder = "<system-reminder>\n";
+    const size_t heading = text.compare(0, reminder.size(), reminder) == 0 ? reminder.size() : 0;
+    return text.compare(heading, 14, "# Environment\n") == 0 ? text : std::string();
+}
+
+// Claude Code and the Claude desktop app send the environment (the working directories, the system, the deferred
+// tools, the agents, the skills, the date) as a system message right after the user's first words. Demoted where it
+// stands (below), it followed the words, so a new conversation of the same setup shared only the system prompt and
+// the tools. When it directly follows the conversation's first user message, its text goes into that message ahead
+// of the user's words, after the system reminders that open the message, with a blank line after it; a later system
+// message is demoted as before. Returns the number of characters of the message's text (its text parts in order)
+// that come before the user's words, where the server keeps a state (SERVER_FIRST_USER_CONTEXT_CHARS); 0 when the
+// request has no environment there.
+static size_t anthropic_join_environment(json & messages) {
+    const auto role_of = [](const json & message) { return json_value(message, "role", std::string()); };
+    size_t first = 0;
+    while (first < messages.size() && role_of(messages[first]) == "system") {
+        first++;
+    }
+    if (first + 1 >= messages.size() || role_of(messages[first]) != "user" ||
+        role_of(messages[first + 1]) != "system") {
+        return 0;
+    }
+    const std::string environment = anthropic_environment_text(messages[first + 1]);
+    if (environment.empty() || !messages[first].contains("content") ||
+        (!messages[first].at("content").is_string() && !messages[first].at("content").is_array())) {
+        return 0;
+    }
+    json & content = messages[first].at("content");
+    const std::string text = environment + "\n\n";
+    size_t chars = text.size();
+    if (content.is_string()) {
+        content = text + content.get<std::string>();
+    } else {
+        const auto is_text = [](const json & part) {
+            return json_value(part, "type", std::string()) == "text" && part.contains("text") &&
+                   part.at("text").is_string();
+        };
+        size_t words = 0;
+        while (words < content.size() && is_text(content[words]) &&
+               content[words].at("text").get<std::string>().rfind("<system-reminder>", 0) == 0) {
+            chars += content[words].at("text").get<std::string>().size();
+            words++;
+        }
+        if (words < content.size() && is_text(content[words])) {
+            content[words]["text"] = text + content[words].at("text").get<std::string>();
+        } else {
+            content.insert(content.begin() + words, json{ { "type", "text" }, { "text", text } });
+        }
+    }
+    messages.erase(messages.begin() + first + 1);
+    return chars;
+}
+
 json server_chat_convert_anthropic_to_oai(const json & body) {
     json oai_body;
 
     // Convert system prompt
     json oai_messages = json::array();
     auto system_param = json_value(body, "system", json());
+    // the variants of Claude Code's system prompt and tools render as one (see inferssd/app-versions.h)
+    const bool claude_code = server_is_claude_code(system_param);
+    if (claude_code) {
+        server_unify_claude_code_system(system_param);
+    }
     if (!system_param.is_null()) {
         std::string system_content;
 
@@ -799,15 +1136,23 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
+    const size_t first_user_context_chars = anthropic_join_environment(oai_messages);
     anthropic_demote_mid_conversation_system_messages(oai_messages);
     oai_body["messages"] = oai_messages;
+    if (first_user_context_chars > 0) {
+        // read and removed by oaicompat_chat_params_parse
+        oai_body[SERVER_FIRST_USER_CONTEXT_CHARS] = first_user_context_chars;
+    }
 
     // Convert tools
     if (body.contains("tools")) {
         const json & tools = body.at("tools");
         if (tools.is_array()) {
             json oai_tools = json::array();
-            for (const auto & tool : tools) {
+            for (json tool : tools) {
+                if (claude_code) {
+                    server_unify_claude_code_tool(tool);
+                }
                 oai_tools.push_back({
                     {"type", "function"},
                     {"function", {
