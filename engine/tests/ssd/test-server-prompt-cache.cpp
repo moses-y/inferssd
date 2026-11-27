@@ -3,6 +3,7 @@
 
 #include "gguf.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -374,9 +375,19 @@ static void test_prefix_dir_takes_only_this_models_files() {
     const auto dir = fresh_dir("inferssd-test-prefix-dir-models");
     // a file of another build's prompt cache for this model, one for another model, one whose model's fingerprint
     // only starts the same
-    write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model|build 2", { 1, 2, 3, 4, 5, 6 }, 64);
-    write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model|build 1", { 1, 2, 3, 4, 5, 6 }, 64);
-    write_prompt_file((dir / "c.prompt").string(), "prefix-cache 1|this model 2|build 1", { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model|build 2|adapter-cache=1",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model|build 1|adapter-cache=1",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "c.prompt").string(), "prefix-cache 1|this model 2|build 1|adapter-cache=1",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
+    // An old local file has no base-model provenance, even under a release filename.
+    const auto legacy = dir / "prefix-cache-09be34f60064f237dd7bc0fc70e78e5deb14c4af36b315ceab9a92e635c8ae75.prompt";
+    write_prompt_file(legacy.string(), "prefix-cache 1|this model|build 2",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "lora.prompt").string(),
+                      "prefix-cache 1|this model|build 1|adapter-cache=1|lora=0123456789abcdef",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
 
     server_prompt_cache cache(1, 0);
     cache.use_prefix_dir(dir.string(), "prefix-cache 1|this model");
@@ -384,13 +395,38 @@ static void test_prefix_dir_takes_only_this_models_files() {
     require(cache.states.front().n_tokens() == 6 && cache.states.front().file == (dir / "a.prompt").string(),
             "the prefix cache keeps its tokens and its file");
     require(std::filesystem::exists(dir / "b.prompt"), "a prefix cache of another model stays where it is");
+    require(std::filesystem::exists(legacy), "an unverified legacy file stays where it is");
     require(cache.size() == 0 && cache.n_tokens() == 0, "a prefix cache does not count against the cache's limits");
+    auto adapted = make_prompt({ 1, 2, 3, 4, 5, 6 });
+    adapted.adapter_key = "0123456789abcdef";
+    require(!server_prompt_cache_testing::contains(cache, adapted, COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
+            "a portable base prefix does not satisfy an adapted request");
+    std::filesystem::remove_all(dir);
+}
+
+static void test_writable_adapter_fingerprint() {
+    const auto dir = fresh_dir("inferssd-test-writable-adapter-cache");
+    const std::string current = "prefix-cache 1|this model|unknown|adapter-cache=1";
+    write_prompt_file((dir / "legacy.prompt").string(), "prefix-cache 1|this model|unknown", { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "base.prompt").string(), current, { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "lora.prompt").string(), current + "|lora=0123456789abcdef", { 1, 2, 3 }, 64);
+
+    server_prompt_cache cache(4, 0);
+    cache.use_dir(dir.string(), current);
+    require(cache.states.size() == 2, "writable caches take only their adapter-aware fingerprint");
+    require(!std::filesystem::exists(dir / "legacy.prompt"), "legacy writable state has no adapter provenance");
+    require(server_prompt_cache_testing::contains(cache, make_prompt({ 1, 2, 3 }), COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
+            "a base-model writable state keeps its empty adapter key");
+    auto adapted = make_prompt({ 1, 2, 3 });
+    adapted.adapter_key = "0123456789abcdef";
+    require(server_prompt_cache_testing::contains(cache, adapted, COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
+            "an adapted writable state keeps its distinct adapter key");
     std::filesystem::remove_all(dir);
 }
 
 static void test_prefix_cache_outlives_the_cache_limits_and_newer_states() {
     const auto dir = fresh_dir("inferssd-test-prefix-dir-limits");
-    write_prompt_file((dir / "p.prompt").string(), "fp", { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "p.prompt").string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4, 5, 6 }, 64);
 
     // a cache of 1 MiB in memory, with the prefix cache and two states of its own of 0.75 MiB each
     server_prompt_cache cache(1, 0);
@@ -418,25 +454,83 @@ static void test_prefix_cache_outlives_the_cache_limits_and_newer_states() {
 
 static void test_prefix_dir_is_read_again_when_it_changes() {
     const auto dir = fresh_dir("inferssd-test-prefix-dir-changes");
+    const auto original = dir / "p.prompt";
+    const auto neighbor = dir / "q.prompt";
     server_prompt_cache cache(1, 0);
     cache.use_prefix_dir(dir.string(), "fp");
     require(cache.states.empty(), "an empty directory has no prefix caches");
 
     // a download finishes while the server runs
-    write_prompt_file((dir / "p.prompt").string(), "fp", { 1, 2, 3, 4 }, 16);
+    write_prompt_file(original.string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4 }, 16);
     touch_dir(dir, 2);
     server_prompt_cache_testing::scan_prefix_dir(cache);
     require(count_read_only(cache) == 1, "a prefix cache put in the directory is found");
     server_prompt_cache_testing::scan_prefix_dir(cache);
     require(count_read_only(cache) == 1, "a prefix cache is taken once");
 
-    // an update replaces it
-    std::filesystem::remove(dir / "p.prompt");
-    write_prompt_file((dir / "q.prompt").string(), "fp", { 1, 2, 3, 4, 5 }, 16);
+    const auto indexed_original = [&]() -> server_prompt & {
+        const auto entry = std::find_if(cache.states.begin(), cache.states.end(), [&](const auto & prompt) {
+            return prompt.read_only && prompt.file == original.string();
+        });
+        require(entry != cache.states.end(), "the surviving prefix stays in the index");
+        return *entry;
+    };
+    // This in-memory field is not serialized. Reloading the same header would reset it.
+    indexed_original().n_conversation = 3;
+    write_prompt_file(neighbor.string(), "fp|build|adapter-cache=1", { 5, 6, 7 }, 16);
     touch_dir(dir, 4);
     server_prompt_cache_testing::scan_prefix_dir(cache);
-    require(count_read_only(cache) == 1 && cache.states.front().n_tokens() == 5,
-            "a removed prefix cache goes, its replacement is found");
+    require(count_read_only(cache) == 2, "adding a neighbor indexes the new prefix");
+    require(indexed_original().n_conversation == 3, "adding a neighbor must not reindex an unchanged prefix");
+
+    std::filesystem::remove(neighbor);
+    touch_dir(dir, 6);
+    server_prompt_cache_testing::scan_prefix_dir(cache);
+    require(count_read_only(cache) == 1, "removing a neighbor removes its indexed prefix");
+    require(indexed_original().n_conversation == 3, "removing a neighbor must not reindex an unchanged prefix");
+
+    // A download can replace a prefix while retaining the pathname, size, and modification time.
+    const auto replacement = dir / "replacement.tmp";
+    const auto original_time = std::filesystem::last_write_time(original);
+    write_prompt_file(replacement.string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4, 5 }, 16 - sizeof(llama_token));
+    require(std::filesystem::file_size(replacement) == std::filesystem::file_size(original),
+            "the replacement must have the same file size");
+    std::filesystem::last_write_time(replacement, original_time);
+    std::filesystem::rename(replacement, original);
+    require(std::filesystem::last_write_time(original) == original_time,
+            "the replacement must have the same modification time");
+    touch_dir(dir, 8);
+    server_prompt_cache_testing::scan_prefix_dir(cache);
+    require(count_read_only(cache) == 1 && indexed_original().n_tokens() == 5 &&
+            indexed_original().file_data_size == 16 - sizeof(llama_token) && indexed_original().n_conversation == 0,
+            "a same-path replacement must update the indexed tokens and state size");
+    std::filesystem::remove_all(dir);
+}
+
+static void test_rejected_prefix_versions() {
+    const auto dir = fresh_dir("inferssd-test-prefix-dir-rejected");
+    const auto prefix = dir / "prefix.prompt";
+    const auto neighbor = dir / "neighbor.prompt";
+    write_prompt_file(prefix.string(), "fp|old", { 1, 2, 3 }, 16);
+    server_prompt_cache cache(1, 0);
+    cache.use_prefix_dir(dir.string(), "fp");
+    require(cache.states.empty() && server_prompt_cache_testing::unusable_prefixes(cache) == 1,
+            "an unpublished legacy header is rejected and its file version remembered");
+
+    write_prompt_file(neighbor.string(), "fp|old", { 4, 5, 6 }, 16);
+    touch_dir(dir, 2);
+    server_prompt_cache_testing::scan_prefix_dir(cache);
+    require(cache.states.empty() && server_prompt_cache_testing::unusable_prefixes(cache) == 2,
+            "refresh keeps the earlier rejection and records the new one");
+
+    std::filesystem::remove(neighbor);
+    const auto replacement = dir / "replacement.tmp";
+    write_prompt_file(replacement.string(), "fp|build|adapter-cache=1", { 1, 2, 3 }, 16);
+    std::filesystem::rename(replacement, prefix);
+    touch_dir(dir, 4);
+    server_prompt_cache_testing::scan_prefix_dir(cache);
+    require(count_read_only(cache) == 1 && server_prompt_cache_testing::unusable_prefixes(cache) == 0,
+            "a valid replacement is admitted and the removed file's rejection is forgotten");
     std::filesystem::remove_all(dir);
 }
 
@@ -480,8 +574,10 @@ static void test_model_identity_ignores_path_and_time() {
 
 int main() {
     test_prefix_dir_takes_only_this_models_files();
+    test_writable_adapter_fingerprint();
     test_prefix_cache_outlives_the_cache_limits_and_newer_states();
     test_prefix_dir_is_read_again_when_it_changes();
+    test_rejected_prefix_versions();
     test_model_identity_ignores_path_and_time();
     test_prompt_batches_stop_at_shared_prefix_and_end();
     test_prompt_batches_stop_at_kept_prefixes_only();
