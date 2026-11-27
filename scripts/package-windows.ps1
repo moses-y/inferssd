@@ -5,8 +5,10 @@ param(
   [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist'),
   [string]$BuildDirectory = '',
   [int]$Jobs = 2,
-  # Real code for the GPU generations people run; PTX for the rest, compiled by the driver on first use.
-  [string]$CudaArchitectures = '75-virtual;80-virtual;86-real;89-real;120a-real',
+  # ggml-cuda's default for a CUDA 12.8+ toolkit (engine/ggml/src/ggml-cuda/CMakeLists.txt): PTX for
+  # Maxwell, Pascal, Volta, Turing and Ampere, compiled by the driver on first use, and real code for
+  # Ampere, Ada and Blackwell. Its 121a-real is left out: only the GB10, which runs no x64 Windows, has it.
+  [string]$CudaArchitectures = '50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;120a-real',
   # The driver of the CUDA toolkit this package is built with (12.9 Update 1): the oldest that runs its
   # runtime and compiles its PTX.
   [string]$MinimumNvidiaDriver = '576.57',
@@ -50,6 +52,14 @@ try {
   $targets = @('inferssd-server', 'inferssd-cpuprobe', 'inferssd-ssdprobe')
   if ($Backend -eq 'cuda') {
     $cuda = $env:CUDA_PATH.Replace('\', '/')
+    # The package runs on every GPU its toolkit compiles for: its first architecture is the toolkit's
+    # oldest (5.0 for CUDA 12), as in ggml-cuda's default. A list that starts later leaves the GPUs
+    # before it without code (no kernel image is available).
+    $toolkit = @(& "$cuda/bin/nvcc.exe" --list-gpu-arch | Where-Object { $_ -match '^compute_[0-9]+' })
+    if ($LASTEXITCODE -ne 0 -or !$toolkit.Count) { throw "nvcc --list-gpu-arch listed no architecture ($LASTEXITCODE)." }
+    $oldest = ($toolkit | ForEach-Object { [int]($_ -replace '^compute_([0-9]+).*$', '$1') } | Measure-Object -Minimum).Minimum
+    $first = ($CudaArchitectures -split ';' | ForEach-Object { [int]($_ -replace '^([0-9]+).*$', '$1') } | Measure-Object -Minimum).Minimum
+    if ($first -gt $oldest) { throw "CudaArchitectures starts at $first, after the toolkit's oldest architecture $oldest." }
     $configure = @('--preset', 'windows-cuda') + $configure + @('-DGGML_VULKAN=OFF',
       "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures", "-DCUDAToolkit_ROOT=$cuda", "-DCMAKE_CUDA_COMPILER=$cuda/bin/nvcc.exe")
     $targets += 'inferssd-memprobe'
